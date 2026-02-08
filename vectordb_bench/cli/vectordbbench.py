@@ -33,6 +33,7 @@ from ..backend.clients.turbopuffer.cli import TurboPuffer
 from ..backend.clients.vespa.cli import Vespa
 from ..backend.clients.weaviate_cloud.cli import Weaviate
 from ..backend.clients.zilliz_cloud.cli import ZillizAutoIndex
+from ..backend.clients.lsm_vec.cli import lsmvec
 from .batch_cli import BatchCli
 from .cli import cli
 
