@@ -1,5 +1,24 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+onErr() {
+  local rc=$?
+  echo "[ERROR] rc=${rc} line=${BASH_LINENO[0]} cmd=${BASH_COMMAND}" >&2
+}
+onExit() {
+  local rc=$?
+  echo "[EXIT] rc=${rc}" >&2
+}
+trap onErr ERR
+trap onExit EXIT
+
+requireCmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "ERROR: missing command: $cmd" >&2
+    exit 127
+  }
+}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -32,18 +51,16 @@ QDRANT_EF_CONSTRUCT="${QDRANT_EF_CONSTRUCT:-200}"
 
 REPEATS="${REPEATS:-1}"
 
-# docker 采样配置
 ENABLE_DOCKER_MEM_SAMPLING="${ENABLE_DOCKER_MEM_SAMPLING:-true}"
 DOCKER_STATS_INTERVAL_SEC="${DOCKER_STATS_INTERVAL_SEC:-1}"
 DOCKER_STATS_OUT_DIR="${DOCKER_STATS_OUT_DIR:-$ROOT/bench_runs/docker_stats}"
-# 只采样这些 compose project
 DOCKER_STATS_PROJECTS="${DOCKER_STATS_PROJECTS:-milvus,weaviate}"
-# 额外按名字匹配这些容器（逗号分隔）
 DOCKER_STATS_NAME_FILTERS="${DOCKER_STATS_NAME_FILTERS:-qdrant}"
 
-#   ./run_bench_with_docker_mem.sh all
-#   ./run_bench_with_docker_mem.sh baselines
-#   ./run_bench_with_docker_mem.sh lsmvec
+ENABLE_HOST_MEM_SAMPLING="${ENABLE_HOST_MEM_SAMPLING:-true}"
+HOST_STATS_INTERVAL_SEC="${HOST_STATS_INTERVAL_SEC:-1}"
+HOST_STATS_OUT_DIR="${HOST_STATS_OUT_DIR:-$ROOT/bench_runs/host_stats}"
+
 TARGET="${1:-all}"
 
 verifyDatasetDir() {
@@ -77,6 +94,29 @@ trainFileCount() {
   local shards=("$dir"/train-*-of-*.parquet)
   shopt -u nullglob
   echo "${#shards[@]}"
+}
+
+getServerMemSummaryMiB() {
+  awk '
+    $1=="MemTotal:" {t=$2}
+    $1=="MemAvailable:" {a=$2}
+    END {
+      if (t=="" || a=="") {
+        printf "0.00\t0.00\t0.00\n"
+        exit
+      }
+      used_kib = t - a
+      printf "%.2f\t%.2f\t%.2f\n", used_kib/1024.0, t/1024.0, a/1024.0
+    }
+  ' /proc/meminfo 2>/dev/null || echo -e "0.00\t0.00\t0.00"
+}
+
+
+printSystemMemBefore() {
+  local label="$1"
+  local used total avail
+  IFS=$'\t' read -r used total avail < <(getServerMemSummaryMiB)
+  echo "system memory before running ${label} is ${used} MiB (used), total ${total} MiB, available ${avail} MiB"
 }
 
 writeYaml() {
@@ -265,13 +305,11 @@ YML
   echo "Batch config written to: $OUT_YML"
 }
 
-# 返回三列: container_id \t container_name \t compose_project
 listTargetContainers() {
   local projectsCsv="$1"
   local nameFiltersCsv="$2"
 
   {
-    # 按 project label 抓 milvus 和 weaviate
     IFS=',' read -r -a projects <<< "$projectsCsv"
     for p in "${projects[@]}"; do
       p="$(echo "$p" | xargs)"
@@ -281,7 +319,6 @@ listTargetContainers() {
         --format '{{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.project"}}' || true
     done
 
-    # 额外按名字抓 qdrant（它没有 compose label）
     IFS=',' read -r -a names <<< "$nameFiltersCsv"
     for n in "${names[@]}"; do
       n="$(echo "$n" | xargs)"
@@ -293,7 +330,52 @@ listTargetContainers() {
   } | awk 'NF>=2 {print $1 "\t" $2 "\t" $3}' | sort -u
 }
 
-SAMPLER_PID=""
+DOCKER_SAMPLER_PID=""
+dockerSamplerLoop() {
+  local outFile="$1"
+  local intervalSec="$2"
+  local projectsCsv="$3"
+  local nameFiltersCsv="$4"
+
+  while true; do
+    local ts containerList ids stats
+    local used total avail serverMemUsed
+
+    ts="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')"
+    IFS=$'\t' read -r used total avail < <(getServerMemSummaryMiB)
+    serverMemUsed="$used"
+
+    containerList="$(listTargetContainers "$projectsCsv" "$nameFiltersCsv" || true)"
+    if [[ -z "$containerList" ]]; then
+      sleep "$intervalSec"
+      continue
+    fi
+
+    ids="$(echo "$containerList" | awk '{print $1}' | tr '\n' ' ')"
+    if [[ -z "$ids" ]]; then
+      sleep "$intervalSec"
+      continue
+    fi
+
+    stats="$(docker stats --no-stream \
+      --format '{{.Container}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}' \
+      $ids 2>/dev/null || true)"
+
+    if [[ -n "$stats" ]]; then
+      awk -v ts="$ts" -v serverMemUsed="$serverMemUsed" -F'\t' '
+        NR==FNR {name[$1]=$2; proj[$1]=$3; next}
+        {
+          id=$1
+          if (id in name) {
+            print ts "\t" name[id] "\t" proj[id] "\t" $2 "\t" $3 "\t" $4 "\t" serverMemUsed
+          }
+        }
+      ' <(echo "$containerList") <(echo "$stats") >> "$outFile"
+    fi
+
+    sleep "$intervalSec"
+  done
+}
 
 startDockerMemSampler() {
   local outFile="$1"
@@ -302,45 +384,10 @@ startDockerMemSampler() {
   local nameFiltersCsv="$4"
 
   mkdir -p "$(dirname "$outFile")"
-  echo -e "ts_utc\tcontainer_name\tcompose_project\tmem_usage\tmem_perc\tcpu_perc" > "$outFile"
+  echo -e "ts_utc\tcontainer_name\tcompose_project\tmem_usage\tmem_perc\tcpu_perc\tserver_mem_used_mib" > "$outFile"
 
-  (
-    while true; do
-      ts="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')"
-
-      containerList="$(listTargetContainers "$projectsCsv" "$nameFiltersCsv" || true)"
-      if [[ -z "$containerList" ]]; then
-        sleep "$intervalSec"
-        continue
-      fi
-
-      ids="$(echo "$containerList" | awk '{print $1}' | tr '\n' ' ')"
-      if [[ -z "$ids" ]]; then
-        sleep "$intervalSec"
-        continue
-      fi
-
-      stats="$(docker stats --no-stream \
-        --format '{{.Container}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}' \
-        $ids 2>/dev/null || true)"
-
-      if [[ -n "$stats" ]]; then
-        awk -v ts="$ts" -F'\t' '
-          NR==FNR {name[$1]=$2; proj[$1]=$3; next}
-          {
-            id=$1
-            if (id in name) {
-              print ts "\t" name[id] "\t" proj[id] "\t" $2 "\t" $3 "\t" $4
-            }
-          }
-        ' <(echo "$containerList") <(echo "$stats") >> "$outFile"
-      fi
-
-      sleep "$intervalSec"
-    done
-  ) >/dev/null 2>&1 &
-
-  SAMPLER_PID=$!
+  dockerSamplerLoop "$outFile" "$intervalSec" "$projectsCsv" "$nameFiltersCsv" >/dev/null 2>&1 &
+  DOCKER_SAMPLER_PID=$!
 }
 
 stopDockerMemSampler() {
@@ -351,7 +398,107 @@ stopDockerMemSampler() {
   fi
 }
 
+getProcessTreePids() {
+  local rootPid="$1"
+  if [[ -z "$rootPid" ]] || ! kill -0 "$rootPid" 2>/dev/null; then
+    return 0
+  fi
+
+  declare -A visited
+  local -a queue all
+  queue=("$rootPid")
+  all=("$rootPid")
+  visited["$rootPid"]=1
+
+  while [[ ${#queue[@]} -gt 0 ]]; do
+    local pid="${queue[0]}"
+    queue=("${queue[@]:1}")
+
+    local children
+    children="$(ps --no-headers -o pid= --ppid "$pid" 2>/dev/null | awk '{print $1}' || true)"
+    [[ -z "$children" ]] && continue
+
+    local c
+    while read -r c; do
+      [[ -z "$c" ]] && continue
+      if [[ -z "${visited[$c]+x}" ]]; then
+        visited["$c"]=1
+        all+=("$c")
+        queue+=("$c")
+      fi
+    done <<< "$children"
+  done
+
+  printf "%s\n" "${all[@]}"
+}
+
+HOST_SAMPLER_PID=""
+hostSamplerLoop() {
+  local outFile="$1"
+  local intervalSec="$2"
+  local rootPid="$3"
+
+  while kill -0 "$rootPid" 2>/dev/null; do
+    local ts rssSumKib rssSumMib num
+    local used total avail serverMemUsed
+    local -a pids
+
+    ts="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')"
+    IFS=$'\t' read -r used total avail < <(getServerMemSummaryMiB)
+    serverMemUsed="$used"
+
+    mapfile -t pids < <(getProcessTreePids "$rootPid" || true)
+    num="${#pids[@]}"
+
+    if [[ "$num" -eq 0 ]]; then
+      echo -e "${ts}\t${rootPid}\t0\t0\t0\t${serverMemUsed}" >> "$outFile"
+      sleep "$intervalSec"
+      continue
+    fi
+
+    rssSumKib="$(
+      ps -o rss= -p "$(IFS=','; echo "${pids[*]}")" 2>/dev/null \
+        | awk '{s+=$1} END{printf "%.0f", s+0}'
+    )"
+    rssSumMib="$(awk -v x="$rssSumKib" 'BEGIN{printf "%.2f", x/1024.0}')"
+
+    echo -e "${ts}\t${rootPid}\t${num}\t${rssSumKib}\t${rssSumMib}\t${serverMemUsed}" >> "$outFile"
+    sleep "$intervalSec"
+  done
+}
+
+startHostMemSampler() {
+  local outFile="$1"
+  local intervalSec="$2"
+  local rootPid="$3"
+
+  mkdir -p "$(dirname "$outFile")"
+  echo -e "ts_utc\troot_pid\tnum_procs\trss_kib\trss_mib\tserver_mem_used_mib" > "$outFile"
+
+  hostSamplerLoop "$outFile" "$intervalSec" "$rootPid" >/dev/null 2>&1 &
+  HOST_SAMPLER_PID=$!
+}
+
+stopHostMemSampler() {
+  local pid="${1:-}"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
 main() {
+  requireCmd awk
+  requireCmd ps
+  requireCmd tee
+  requireCmd vectordbbench
+
+  if [[ "$ENABLE_DOCKER_MEM_SAMPLING" == "true" ]]; then
+    requireCmd docker
+  fi
+
+  mkdir -p "$ROOT/bench_runs" "$DOCKER_STATS_OUT_DIR" "$HOST_STATS_OUT_DIR"
+
   verifyDatasetDir "$SIFT100K_DIR"
   verifyDatasetDir "$SIFT1M_DIR"
 
@@ -365,36 +512,55 @@ main() {
   for i in $(seq 1 "$REPEATS"); do
     echo "Run $i / $REPEATS (TARGET=$TARGET)"
 
-    local runTs outLog statsFile samplerPid
-    runTs="$(date -u '+%Y%m%dT%H%M%SZ')"
+    local runTs outLog dockerStatsFile hostStatsFile
+    local dockerSamplerPid hostSamplerPid benchPid exitCode
 
+    runTs="$(date -u '+%Y%m%dT%H%M%SZ')"
     outLog="$ROOT/bench_runs/run_${runTs}_target_${TARGET}.log"
-    statsFile="$DOCKER_STATS_OUT_DIR/docker_mem_${runTs}_target_${TARGET}.tsv"
-    samplerPid=""
+    dockerStatsFile="$DOCKER_STATS_OUT_DIR/docker_mem_${runTs}_target_${TARGET}.tsv"
+    hostStatsFile="$HOST_STATS_OUT_DIR/host_mem_${runTs}_target_${TARGET}.tsv"
+
+    dockerSamplerPid=""
+    hostSamplerPid=""
 
     if [[ "$ENABLE_DOCKER_MEM_SAMPLING" == "true" ]]; then
+      printSystemMemBefore "docker mem sampler"
       echo "Docker mem sampling enabled, interval=${DOCKER_STATS_INTERVAL_SEC}s"
       echo "Projects: $DOCKER_STATS_PROJECTS"
       echo "Name filters: $DOCKER_STATS_NAME_FILTERS"
-      echo "Stats file: $statsFile"
-      startDockerMemSampler "$statsFile" "$DOCKER_STATS_INTERVAL_SEC" "$DOCKER_STATS_PROJECTS" "$DOCKER_STATS_NAME_FILTERS"
-      samplerPid="$SAMPLER_PID"
-      trap 'stopDockerMemSampler "${samplerPid:-}"; exit 1' INT TERM
-      trap 'stopDockerMemSampler "${samplerPid:-}"' EXIT
+      echo "Docker stats file: $dockerStatsFile"
+      startDockerMemSampler "$dockerStatsFile" "$DOCKER_STATS_INTERVAL_SEC" "$DOCKER_STATS_PROJECTS" "$DOCKER_STATS_NAME_FILTERS"
+      dockerSamplerPid="$DOCKER_SAMPLER_PID"
     fi
 
-    set +e
-    vectordbbench batchcli --batch-config-file "$OUT_YML" 2>&1 | tee "$outLog"
-    exitCode=${PIPESTATUS[0]}
-    set -e
+    printSystemMemBefore "vectordbbench batchcli"
+    echo "Run log: $outLog"
 
-    if [[ "$ENABLE_DOCKER_MEM_SAMPLING" == "true" ]]; then
-      stopDockerMemSampler "$samplerPid"
-      echo "Docker mem sampling stopped, file written: $statsFile"
+    # Run vectordbbench in background so we can sample its process tree.
+    # Use process substitution for tee so we keep the real PID.
+    stdbuf -oL -eL vectordbbench batchcli --batch-config-file "$OUT_YML" > >(tee "$outLog") 2>&1 &
+    benchPid=$!
+
+    if [[ "$ENABLE_HOST_MEM_SAMPLING" == "true" ]]; then
+      printSystemMemBefore "host mem sampler (process tree of pid ${benchPid})"
+      echo "Host mem sampling enabled, interval=${HOST_STATS_INTERVAL_SEC}s"
+      echo "Host stats file: $hostStatsFile"
+      echo "Host root pid: $benchPid"
+      startHostMemSampler "$hostStatsFile" "$HOST_STATS_INTERVAL_SEC" "$benchPid"
+      hostSamplerPid="$HOST_SAMPLER_PID"
     fi
+
+    wait "$benchPid"
+    exitCode=$?
+
+    stopHostMemSampler "$hostSamplerPid"
+    stopDockerMemSampler "$dockerSamplerPid"
+
+    [[ "$ENABLE_DOCKER_MEM_SAMPLING" == "true" ]] && echo "Docker stats: $dockerStatsFile"
+    [[ "$ENABLE_HOST_MEM_SAMPLING" == "true" ]] && echo "Host stats: $hostStatsFile"
 
     if [[ $exitCode -ne 0 ]]; then
-      echo "ERROR: vectordbbench exited with code $exitCode, log: $outLog" >&2
+      echo "ERROR: vectordbbench exited with code $exitCode" >&2
       exit $exitCode
     fi
   done
