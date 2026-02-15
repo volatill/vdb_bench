@@ -34,6 +34,7 @@ QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 
 WEAVIATE_URL="${WEAVIATE_URL:-http://localhost:8080}"
 WEAVIATE_NO_AUTH="${WEAVIATE_NO_AUTH:-true}"
+WEAVIATE_API_KEY="${WEAVIATE_API_KEY:-}"
 
 DOCKER_VOLUME_DIRECTORY="${DOCKER_VOLUME_DIRECTORY:-/var/tmp}"
 
@@ -61,7 +62,37 @@ ENABLE_HOST_MEM_SAMPLING="${ENABLE_HOST_MEM_SAMPLING:-true}"
 HOST_STATS_INTERVAL_SEC="${HOST_STATS_INTERVAL_SEC:-1}"
 HOST_STATS_OUT_DIR="${HOST_STATS_OUT_DIR:-$ROOT/bench_runs/host_stats}"
 
-TARGET="${1:-all}"
+TARGET_RAW="${1:-all}"
+TARGET=""
+
+normalizeTarget() {
+  local t="$1"
+  case "$t" in
+    all|baselines|lsmvec|milvushnsw|qdrantlocal|weaviate) echo "$t" ;;
+    milvus) echo "milvushnsw" ;;
+    qdrant) echo "qdrantlocal" ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+TARGET="$(normalizeTarget "$TARGET_RAW")"
+
+wantSection() {
+  local section="$1" # milvushnsw|qdrantlocal|weaviate|lsmvec
+  case "$TARGET" in
+    all) return 0 ;;
+    baselines)
+      [[ "$section" != "lsmvec" ]]
+      return $?
+      ;;
+    *)
+      [[ "$section" == "$TARGET" ]]
+      return $?
+      ;;
+  esac
+}
 
 verifyDatasetDir() {
   local dir="$1"
@@ -111,7 +142,6 @@ getServerMemSummaryMiB() {
   ' /proc/meminfo 2>/dev/null || echo -e "0.00\t0.00\t0.00"
 }
 
-
 printSystemMemBefore() {
   local label="$1"
   local used total avail
@@ -130,7 +160,7 @@ writeYaml() {
 # Auto-generated. Do not edit by hand.
 YML
 
-  if [[ "$TARGET" == "all" || "$TARGET" == "baselines" ]]; then
+  if wantSection "milvushnsw"; then
     cat >> "$OUT_YML" <<YML
 
 milvushnsw:
@@ -175,6 +205,11 @@ milvushnsw:
     ef_search: $MILVUS_EF_SEARCH
     drop_old: true
     load: true
+YML
+  fi
+
+  if wantSection "qdrantlocal"; then
+    cat >> "$OUT_YML" <<YML
 
 qdrantlocal:
   - db_label: qdrant_sift100k
@@ -214,6 +249,11 @@ qdrantlocal:
     ef_construct: $QDRANT_EF_CONSTRUCT
     drop_old: true
     load: true
+YML
+  fi
+
+  if wantSection "weaviate"; then
+    cat >> "$OUT_YML" <<YML
 
 weaviate:
   - db_label: weaviate_sift100k
@@ -235,8 +275,7 @@ weaviate:
     ef: $WEAVIATE_EF
     drop_old: true
     load: true
-    no_auth: true
-    api_key: ""
+    no_auth: $WEAVIATE_NO_AUTH
 
   - db_label: weaviate_sift1m
     url: "$WEAVIATE_URL"
@@ -257,12 +296,11 @@ weaviate:
     ef: $WEAVIATE_EF
     drop_old: true
     load: true
-    no_auth: true
-    api_key: ""
+    no_auth: $WEAVIATE_NO_AUTH
 YML
   fi
 
-  if [[ "$TARGET" == "all" || "$TARGET" == "lsmvec" ]]; then
+  if wantSection "lsmvec"; then
     cat >> "$OUT_YML" <<YML
 
 lsmvec:
@@ -487,6 +525,13 @@ stopHostMemSampler() {
   fi
 }
 
+usage() {
+  cat >&2 <<EOF
+Usage: $0 [all|baselines|lsmvec|milvushnsw|qdrantlocal|weaviate]
+Aliases: milvus -> milvushnsw, qdrant -> qdrantlocal
+EOF
+}
+
 main() {
   requireCmd awk
   requireCmd ps
@@ -502,15 +547,15 @@ main() {
   verifyDatasetDir "$SIFT100K_DIR"
   verifyDatasetDir "$SIFT1M_DIR"
 
-  if [[ "$TARGET" != "all" && "$TARGET" != "baselines" && "$TARGET" != "lsmvec" ]]; then
-    echo "Usage: $0 [all|baselines|lsmvec]" >&2
+  if [[ -z "$TARGET" ]]; then
+    usage
     exit 1
   fi
 
   writeYaml
 
   for i in $(seq 1 "$REPEATS"); do
-    echo "Run $i / $REPEATS (TARGET=$TARGET)"
+    echo "Run $i / $REPEATS (TARGET=$TARGET_RAW -> $TARGET)"
 
     local runTs outLog dockerStatsFile hostStatsFile
     local dockerSamplerPid hostSamplerPid benchPid exitCode

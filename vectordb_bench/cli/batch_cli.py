@@ -56,6 +56,7 @@ def build_sub_cmd_args(batch_config: MutableMapping[str, Any] | None):
         "dry_run": False,
         "custom_dataset_use_shuffled": True,
         "custom_dataset_with_gt": True,
+        "no_auth": False,
     }
 
     def format_option(key: str, value: Any):
