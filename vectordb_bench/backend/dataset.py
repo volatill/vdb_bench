@@ -118,16 +118,31 @@ class CustomDataset(BaseDataset):
     def file_count(self) -> int:
         return self.file_num
 
+    # @property
+    # def train_files(self) -> list[str]:
+    #     train_file = self.train_file
+    #     prefix = f"{train_file}"
+    #     train_files = []
+    #     prefix_s = [item.strip() for item in prefix.split(",") if item.strip()]
+    #     for i in range(len(prefix_s)):
+    #         sub_file = f"{prefix_s[i]}.parquet"
+    #         train_files.append(sub_file)
+    #     return train_files
+
     @property
     def train_files(self) -> list[str]:
-        train_file = self.train_file
-        prefix = f"{train_file}"
-        train_files = []
-        prefix_s = [item.strip() for item in prefix.split(",") if item.strip()]
-        for i in range(len(prefix_s)):
-            sub_file = f"{prefix_s[i]}.parquet"
-            train_files.append(sub_file)
-        return train_files
+        # If user explicitly provides a comma list, respect it.
+        train_file = (self.train_file or "train").strip()
+        if "," in train_file:
+            parts = [p.strip() for p in train_file.split(",") if p.strip()]
+            return [f"{p}.parquet" if not p.endswith(".parquet") else p for p in parts]
+
+        # If file_num > 1 and train_file is the default prefix, auto expand shards.
+        if self.file_num and self.file_num > 1 and train_file in ("train", "shuffle_train"):
+            return utils.compose_train_files(self.file_num, self.use_shuffled)
+
+        # Fallback, single file
+        return [f"{train_file}.parquet" if not train_file.endswith(".parquet") else train_file]
 
 
 class LAION(BaseDataset):

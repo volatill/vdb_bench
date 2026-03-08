@@ -24,6 +24,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SIFT100K_DIR="${SIFT100K_DIR:-$ROOT/datasets/custom/sift100k}"
 SIFT1M_DIR="${SIFT1M_DIR:-$ROOT/datasets/custom/sift1M}"
+SIFT10M_DIR="${SIFT10M_DIR:-$ROOT/datasets/custom/sift10M}"
 
 OUT_YML="${OUT_YML:-$ROOT/bench_runs/bench_custom_sift_build_then_query.yml}"
 
@@ -40,6 +41,7 @@ DOCKER_VOLUME_DIRECTORY="${DOCKER_VOLUME_DIRECTORY:-/var/tmp}"
 
 LSMVEC_DB_ROOT_100K="${LSMVEC_DB_ROOT_100K:-$DOCKER_VOLUME_DIRECTORY/lsmvec/sift100k}"
 LSMVEC_DB_ROOT_1M="${LSMVEC_DB_ROOT_1M:-$DOCKER_VOLUME_DIRECTORY/lsmvec/sift1m}"
+LSMVEC_DB_ROOT_10M="${LSMVEC_DB_ROOT_10M:-$DOCKER_VOLUME_DIRECTORY/lsmvec/sift10m}"
 
 K="${K:-10}"
 NUM_CONCURRENCY="${NUM_CONCURRENCY:-1}"
@@ -63,6 +65,8 @@ HOST_STATS_INTERVAL_SEC="${HOST_STATS_INTERVAL_SEC:-1}"
 HOST_STATS_OUT_DIR="${HOST_STATS_OUT_DIR:-$ROOT/bench_runs/host_stats}"
 
 TARGET_RAW="${1:-all}"
+DATASETS_RAW="${2:-${SIFT_DATASETS:-100k,1m}}"
+
 TARGET=""
 
 normalizeTarget() {
@@ -93,6 +97,34 @@ wantSection() {
       ;;
   esac
 }
+
+# datasets parsing, supports: 100k,1m,10m,all
+DATASETS_NORM="${DATASETS_RAW,,}"
+DATASETS_NORM="${DATASETS_NORM//[[:space:]]/}"
+DATASETS_NORM=",$DATASETS_NORM,"
+
+WANT_100K=false
+WANT_1M=false
+WANT_10M=false
+
+if [[ "$DATASETS_NORM" == *",all,"* ]]; then
+  WANT_100K=true
+  WANT_1M=true
+  WANT_10M=true
+else
+  [[ "$DATASETS_NORM" == *",100k,"* ]] && WANT_100K=true
+  [[ "$DATASETS_NORM" == *",1m,"* ]] && WANT_1M=true
+  [[ "$DATASETS_NORM" == *",10m,"* ]] && WANT_10M=true
+fi
+
+if [[ "$WANT_100K" != "true" && "$WANT_1M" != "true" && "$WANT_10M" != "true" ]]; then
+  echo "ERROR: no datasets selected. Use 100k,1m,10m or all" >&2
+  exit 1
+fi
+
+DATASETS_TAG="${DATASETS_NORM#,}"
+DATASETS_TAG="${DATASETS_TAG%,}"
+DATASETS_TAG="${DATASETS_TAG//,/__}"
 
 verifyDatasetDir() {
   local dir="$1"
@@ -150,9 +182,11 @@ printSystemMemBefore() {
 }
 
 writeYaml() {
-  local sift100kCount sift1mCount
-  sift100kCount="$(trainFileCount "$SIFT100K_DIR")"
-  sift1mCount="$(trainFileCount "$SIFT1M_DIR")"
+  local sift100kCount="" sift1mCount="" sift10mCount=""
+
+  [[ "$WANT_100K" == "true" ]] && sift100kCount="$(trainFileCount "$SIFT100K_DIR")"
+  [[ "$WANT_1M" == "true" ]] && sift1mCount="$(trainFileCount "$SIFT1M_DIR")"
+  [[ "$WANT_10M" == "true" ]] && sift10mCount="$(trainFileCount "$SIFT10M_DIR")"
 
   mkdir -p "$(dirname "$OUT_YML")"
 
@@ -164,6 +198,9 @@ YML
     cat >> "$OUT_YML" <<YML
 
 milvushnsw:
+YML
+    if [[ "$WANT_100K" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
   - db_label: milvus_sift100k
     uri: "$MILVUS_URI"
     password: "$MILVUS_PASSWORD"
@@ -184,6 +221,11 @@ milvushnsw:
     ef_search: $MILVUS_EF_SEARCH
     drop_old: true
     load: true
+YML
+    fi
+
+    if [[ "$WANT_1M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
 
   - db_label: milvus_sift1m
     uri: "$MILVUS_URI"
@@ -206,12 +248,42 @@ milvushnsw:
     drop_old: true
     load: true
 YML
+    fi
+
+    if [[ "$WANT_10M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
+
+  - db_label: milvus_sift10m
+    uri: "$MILVUS_URI"
+    password: "$MILVUS_PASSWORD"
+    case_type: PerformanceCustomDataset
+    custom_case_name: PerfSIFT128D10M
+    custom_dataset_name: SIFT
+    custom_dataset_dir: "$SIFT10M_DIR"
+    custom_dataset_size: 10000000
+    custom_dataset_dim: 128
+    custom_dataset_metric_type: L2
+    custom_dataset_file_count: $sift10mCount
+    custom_dataset_use_shuffled: false
+    custom_dataset_with_gt: true
+    k: $K
+    num_concurrency: $NUM_CONCURRENCY
+    m: $HNSW_M
+    ef_construction: $HNSW_EF_CONSTRUCTION
+    ef_search: $MILVUS_EF_SEARCH
+    drop_old: true
+    load: true
+YML
+    fi
   fi
 
   if wantSection "qdrantlocal"; then
     cat >> "$OUT_YML" <<YML
 
 qdrantlocal:
+YML
+    if [[ "$WANT_100K" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
   - db_label: qdrant_sift100k
     url: "$QDRANT_URL"
     case_type: PerformanceCustomDataset
@@ -230,6 +302,11 @@ qdrantlocal:
     ef_construct: $QDRANT_EF_CONSTRUCT
     drop_old: true
     load: true
+YML
+    fi
+
+    if [[ "$WANT_1M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
 
   - db_label: qdrant_sift1m
     url: "$QDRANT_URL"
@@ -250,12 +327,40 @@ qdrantlocal:
     drop_old: true
     load: true
 YML
+    fi
+
+    if [[ "$WANT_10M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
+
+  - db_label: qdrant_sift10m
+    url: "$QDRANT_URL"
+    case_type: PerformanceCustomDataset
+    custom_case_name: PerfSIFT128D10M
+    custom_dataset_name: SIFT
+    custom_dataset_dir: "$SIFT10M_DIR"
+    custom_dataset_size: 10000000
+    custom_dataset_dim: 128
+    custom_dataset_metric_type: L2
+    custom_dataset_file_count: $sift10mCount
+    custom_dataset_use_shuffled: false
+    custom_dataset_with_gt: true
+    k: $K
+    num_concurrency: $NUM_CONCURRENCY
+    m: $HNSW_M
+    ef_construct: $QDRANT_EF_CONSTRUCT
+    drop_old: true
+    load: true
+YML
+    fi
   fi
 
   if wantSection "weaviate"; then
     cat >> "$OUT_YML" <<YML
 
 weaviate:
+YML
+    if [[ "$WANT_100K" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
   - db_label: weaviate_sift100k
     url: "$WEAVIATE_URL"
     case_type: PerformanceCustomDataset
@@ -276,6 +381,11 @@ weaviate:
     drop_old: true
     load: true
     no_auth: $WEAVIATE_NO_AUTH
+YML
+    fi
+
+    if [[ "$WANT_1M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
 
   - db_label: weaviate_sift1m
     url: "$WEAVIATE_URL"
@@ -298,12 +408,42 @@ weaviate:
     load: true
     no_auth: $WEAVIATE_NO_AUTH
 YML
+    fi
+
+    if [[ "$WANT_10M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
+
+  - db_label: weaviate_sift10m
+    url: "$WEAVIATE_URL"
+    case_type: PerformanceCustomDataset
+    custom_case_name: PerfSIFT128D10M
+    custom_dataset_name: SIFT
+    custom_dataset_dir: "$SIFT10M_DIR"
+    custom_dataset_size: 10000000
+    custom_dataset_dim: 128
+    custom_dataset_metric_type: L2
+    custom_dataset_file_count: $sift10mCount
+    custom_dataset_use_shuffled: false
+    custom_dataset_with_gt: true
+    k: $K
+    num_concurrency: $NUM_CONCURRENCY
+    m: $HNSW_M
+    ef_construction: $HNSW_EF_CONSTRUCTION
+    ef: $WEAVIATE_EF
+    drop_old: true
+    load: true
+    no_auth: $WEAVIATE_NO_AUTH
+YML
+    fi
   fi
 
   if wantSection "lsmvec"; then
     cat >> "$OUT_YML" <<YML
 
 lsmvec:
+YML
+    if [[ "$WANT_100K" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
   - db_label: lsmvec_sift100k
     db_root: "$LSMVEC_DB_ROOT_100K"
     case_type: PerformanceCustomDataset
@@ -320,6 +460,11 @@ lsmvec:
     num_concurrency: $NUM_CONCURRENCY
     drop_old: true
     load: true
+YML
+    fi
+
+    if [[ "$WANT_1M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
 
   - db_label: lsmvec_sift1m
     db_root: "$LSMVEC_DB_ROOT_1M"
@@ -338,6 +483,29 @@ lsmvec:
     drop_old: true
     load: true
 YML
+    fi
+
+    if [[ "$WANT_10M" == "true" ]]; then
+      cat >> "$OUT_YML" <<YML
+
+  - db_label: lsmvec_sift10m
+    db_root: "$LSMVEC_DB_ROOT_10M"
+    case_type: PerformanceCustomDataset
+    custom_case_name: PerfSIFT128D10M
+    custom_dataset_name: SIFT
+    custom_dataset_dir: "$SIFT10M_DIR"
+    custom_dataset_size: 10000000
+    custom_dataset_dim: 128
+    custom_dataset_metric_type: L2
+    custom_dataset_file_count: $sift10mCount
+    custom_dataset_use_shuffled: false
+    custom_dataset_with_gt: true
+    k: $K
+    num_concurrency: $NUM_CONCURRENCY
+    drop_old: true
+    load: true
+YML
+    fi
   fi
 
   echo "Batch config written to: $OUT_YML"
@@ -527,8 +695,19 @@ stopHostMemSampler() {
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 [all|baselines|lsmvec|milvushnsw|qdrantlocal|weaviate]
-Aliases: milvus -> milvushnsw, qdrant -> qdrantlocal
+Usage: $0 [TARGET] [DATASETS]
+TARGET:
+  all|baselines|lsmvec|milvushnsw|qdrantlocal|weaviate
+Aliases:
+  milvus -> milvushnsw
+  qdrant -> qdrantlocal
+DATASETS:
+  100k,1m,10m or all
+Examples:
+  $0 all 100k,1m,10m
+  $0 weaviate 10m
+Env:
+  SIFT_DATASETS=100k,1m
 EOF
 }
 
@@ -544,26 +723,27 @@ main() {
 
   mkdir -p "$ROOT/bench_runs" "$DOCKER_STATS_OUT_DIR" "$HOST_STATS_OUT_DIR"
 
-  verifyDatasetDir "$SIFT100K_DIR"
-  verifyDatasetDir "$SIFT1M_DIR"
-
   if [[ -z "$TARGET" ]]; then
     usage
     exit 1
   fi
 
+  [[ "$WANT_100K" == "true" ]] && verifyDatasetDir "$SIFT100K_DIR"
+  [[ "$WANT_1M" == "true" ]] && verifyDatasetDir "$SIFT1M_DIR"
+  [[ "$WANT_10M" == "true" ]] && verifyDatasetDir "$SIFT10M_DIR"
+
   writeYaml
 
   for i in $(seq 1 "$REPEATS"); do
-    echo "Run $i / $REPEATS (TARGET=$TARGET_RAW -> $TARGET)"
+    echo "Run $i / $REPEATS (TARGET=$TARGET_RAW -> $TARGET, DATASETS=$DATASETS_RAW -> $DATASETS_TAG)"
 
     local runTs outLog dockerStatsFile hostStatsFile
     local dockerSamplerPid hostSamplerPid benchPid exitCode
 
     runTs="$(date -u '+%Y%m%dT%H%M%SZ')"
-    outLog="$ROOT/bench_runs/run_${runTs}_target_${TARGET}.log"
-    dockerStatsFile="$DOCKER_STATS_OUT_DIR/docker_mem_${runTs}_target_${TARGET}.tsv"
-    hostStatsFile="$HOST_STATS_OUT_DIR/host_mem_${runTs}_target_${TARGET}.tsv"
+    outLog="$ROOT/bench_runs/run_${runTs}_target_${TARGET}_ds_${DATASETS_TAG}.log"
+    dockerStatsFile="$DOCKER_STATS_OUT_DIR/docker_mem_${runTs}_target_${TARGET}_ds_${DATASETS_TAG}.tsv"
+    hostStatsFile="$HOST_STATS_OUT_DIR/host_mem_${runTs}_target_${TARGET}_ds_${DATASETS_TAG}.tsv"
 
     dockerSamplerPid=""
     hostSamplerPid=""
@@ -581,8 +761,6 @@ main() {
     printSystemMemBefore "vectordbbench batchcli"
     echo "Run log: $outLog"
 
-    # Run vectordbbench in background so we can sample its process tree.
-    # Use process substitution for tee so we keep the real PID.
     stdbuf -oL -eL vectordbbench batchcli --batch-config-file "$OUT_YML" > >(tee "$outLog") 2>&1 &
     benchPid=$!
 
