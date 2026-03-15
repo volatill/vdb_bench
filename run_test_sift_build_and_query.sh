@@ -212,6 +212,27 @@ printSystemMemBefore() {
   echo "system memory before running ${label} is ${used} MiB (used), total ${total} MiB, available ${avail} MiB"
 }
 
+ensureElasticsearchReachable() {
+  local url="${ELASTICSEARCH_SCHEME}://${ELASTICSEARCH_HOST}:${ELASTICSEARCH_PORT}/"
+  local httpCode="000"
+  local retries="${ELASTICSEARCH_READY_RETRIES:-30}"
+
+  for _ in $(seq 1 "$retries"); do
+    httpCode="$(curl -s -o /dev/null -m 3 -u "${ELASTICSEARCH_USER}:${ELASTICSEARCH_PASSWORD}" -w '%{http_code}' "$url" || true)"
+
+    if [[ "$httpCode" != "000" ]]; then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  echo "ERROR: Elasticsearch is unreachable at $url after ${retries}s" >&2
+  echo "Hint: start baseline services first (e.g. ./start_baseline.sh elasticsearch)." >&2
+  echo "Hint: if your node uses TLS, set ELASTICSEARCH_SCHEME=https." >&2
+  exit 1
+}
+
 writeYaml() {
   local sift100kCount="" sift1mCount="" sift10mCount=""
 
@@ -1100,6 +1121,11 @@ main() {
 
   if [[ "$ENABLE_DOCKER_MEM_SAMPLING" == "true" ]]; then
     requireCmd docker
+  fi
+
+  if wantSection "elasticsearch"; then
+    requireCmd curl
+    ensureElasticsearchReachable
   fi
 
   mkdir -p "$ROOT/bench_runs" "$DOCKER_STATS_OUT_DIR" "$HOST_STATS_OUT_DIR"

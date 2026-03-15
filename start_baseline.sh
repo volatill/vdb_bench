@@ -92,6 +92,7 @@ mkdir -p "${SERV_DIR}/elasticsearch_data"
 docker run -d --name elasticsearch --restart unless-stopped \
   -e discovery.type=single-node \
   -e xpack.security.enabled=true \
+  -e xpack.security.http.ssl.enabled=false \
   -e ELASTIC_PASSWORD=elastic \
   -e ES_JAVA_OPTS="-Xms1g -Xmx1g" \
   -p "${ELASTICSEARCH_PORT}:9200" \
@@ -104,6 +105,7 @@ export PGVECTOR_PORT=${PGVECTOR_EFFECTIVE_PORT}
 export PGVECTOR_DB_NAME=${POSTGRES_DB}
 export PGVECTOR_USER_NAME=${POSTGRES_USER}
 export PGVECTOR_PASSWORD=${POSTGRES_PASSWORD}
+export ELASTICSEARCH_SCHEME=http
 export ELASTICSEARCH_HOST=localhost
 export ELASTICSEARCH_PORT=${ELASTICSEARCH_PORT}
 export ELASTICSEARCH_USER=elastic

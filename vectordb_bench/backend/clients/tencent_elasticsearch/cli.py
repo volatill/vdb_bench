@@ -53,6 +53,7 @@ class TencentElasticsearchTypedDict(CommonTypedDict):
     ef_construction: Annotated[
         int,
         click.option(
+            "--ef-construction",
             "--ef_construction",
             type=int,
             help="HNSW efConstruction parameter",
@@ -63,6 +64,7 @@ class TencentElasticsearchTypedDict(CommonTypedDict):
     num_candidates: Annotated[
         int,
         click.option(
+            "--num-candidates",
             "--num_candidates",
             type=int,
             help="Number of candidates to consider during searching",
