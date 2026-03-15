@@ -54,11 +54,11 @@ class PgVector(VectorDB):
         self._scalar_label_field = "label"
 
         # construct basic units
-        self.conn, self.cursor = self._create_connection(**self.connect_config)
-
-        # create vector extension
+        # first ensure the vector extension exists, then register vector type codecs
+        self.conn, self.cursor = self._create_connection(register_type=False, **self.connect_config)
         self.cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
         self.conn.commit()
+        register_vector(self.conn)
 
         log.info(f"{self.name} config values: {self.connect_config}\n{self.case_config}")
         if not any(
@@ -87,9 +87,10 @@ class PgVector(VectorDB):
         self.conn = None
 
     @staticmethod
-    def _create_connection(**kwargs) -> tuple[Connection, Cursor]:
+    def _create_connection(*, register_type: bool = True, **kwargs) -> tuple[Connection, Cursor]:
         conn = psycopg.connect(**kwargs)
-        register_vector(conn)
+        if register_type:
+            register_vector(conn)
         conn.autocommit = False
         cursor = conn.cursor()
 
