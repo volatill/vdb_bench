@@ -213,23 +213,105 @@ printSystemMemBefore() {
 }
 
 ensureElasticsearchReachable() {
-  local url="${ELASTICSEARCH_SCHEME}://${ELASTICSEARCH_HOST}:${ELASTICSEARCH_PORT}/"
-  local httpCode="000"
+  local configuredScheme="${ELASTICSEARCH_SCHEME}"
+  local configuredHost="${ELASTICSEARCH_HOST}"
+  local configuredPort="${ELASTICSEARCH_PORT}"
   local retries="${ELASTICSEARCH_READY_RETRIES:-30}"
 
-  for _ in $(seq 1 "$retries"); do
-    httpCode="$(curl -s -o /dev/null -m 3 -u "${ELASTICSEARCH_USER}:${ELASTICSEARCH_PASSWORD}" -w '%{http_code}' "$url" || true)"
+  local hosts=()
+  local ports=()
+  local schemes=()
+  local host="" port="" scheme=""
+  local attempted=""
+  local dockerHintShown="false"
 
-    if [[ "$httpCode" != "000" ]]; then
-      return 0
+  appendUnique() {
+    local value="$1"
+    shift
+    local -n arr="$1"
+    local existing=""
+
+    [[ -n "$value" ]] || return 0
+    for existing in "${arr[@]}"; do
+      [[ "$existing" == "$value" ]] && return 0
+    done
+    arr+=("$value")
+  }
+
+  tryUrl() {
+    local url="$1"
+    # Try with explicit auth first (for secured nodes), then without auth.
+    curl -s -o /dev/null -m 3 -u "${ELASTICSEARCH_USER}:${ELASTICSEARCH_PASSWORD}" "$url" 2>/dev/null       || curl -s -o /dev/null -m 3 "$url" 2>/dev/null
+  }
+
+  appendUnique "$configuredHost" hosts
+  appendUnique "$configuredPort" ports
+  appendUnique "$configuredScheme" schemes
+
+  if [[ "$configuredHost" == "localhost" ]]; then
+    appendUnique "127.0.0.1" hosts
+    appendUnique "host.docker.internal" hosts
+
+    if command -v ip >/dev/null 2>&1; then
+      appendUnique "$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')" hosts
     fi
 
-    sleep 1
+    appendUnique "172.17.0.1" hosts
+  fi
+
+  # If an elasticsearch container exists, include its published host port for 9200/tcp.
+  if command -v docker >/dev/null 2>&1     && docker ps -a --format '{{.Names}}' | grep -Fxq 'elasticsearch'; then
+    local mappedPort=""
+    mappedPort="$(docker port elasticsearch 9200/tcp 2>/dev/null | awk -F: 'NR==1 {print $NF}')"
+    appendUnique "$mappedPort" ports
+  fi
+
+  if [[ "$configuredScheme" == "http" ]]; then
+    appendUnique "https" schemes
+  elif [[ "$configuredScheme" == "https" ]]; then
+    appendUnique "http" schemes
+  fi
+
+  for scheme in "${schemes[@]}"; do
+    for host in "${hosts[@]}"; do
+      for port in "${ports[@]}"; do
+        local url="${scheme}://${host}:${port}/"
+        attempted+=" ${url}"
+
+        for _ in $(seq 1 "$retries"); do
+          if tryUrl "$url"; then
+            if [[ "$host" != "$configuredHost" ]]; then
+              echo "[INFO] Elasticsearch is reachable via ${host}; overriding ELASTICSEARCH_HOST for this run."
+              ELASTICSEARCH_HOST="$host"
+            fi
+            if [[ "$port" != "$configuredPort" ]]; then
+              echo "[INFO] Elasticsearch is reachable via port ${port}; overriding ELASTICSEARCH_PORT for this run."
+              ELASTICSEARCH_PORT="$port"
+            fi
+            if [[ "$scheme" != "$configuredScheme" ]]; then
+              echo "[INFO] Elasticsearch is reachable via scheme ${scheme}; overriding ELASTICSEARCH_SCHEME for this run."
+              ELASTICSEARCH_SCHEME="$scheme"
+            fi
+            return 0
+          fi
+          sleep 1
+        done
+      done
+    done
   done
 
-  echo "ERROR: Elasticsearch is unreachable at $url after ${retries}s" >&2
+  echo "ERROR: Elasticsearch is unreachable at ${configuredScheme}://${configuredHost}:${configuredPort}/ after ${retries}s per endpoint candidate" >&2
+  echo "Hint: attempted endpoints:${attempted}" >&2
   echo "Hint: start baseline services first (e.g. ./start_baseline.sh elasticsearch)." >&2
   echo "Hint: if your node uses TLS, set ELASTICSEARCH_SCHEME=https." >&2
+  if command -v docker >/dev/null 2>&1     && docker ps -a --format '{{.Names}}' | grep -Fxq 'elasticsearch'; then
+    echo "Hint: an 'elasticsearch' container exists; check readiness with: docker logs --tail 100 elasticsearch" >&2
+    echo "Hint: inspect mapped ports with: docker port elasticsearch 9200/tcp" >&2
+    dockerHintShown="true"
+  fi
+  if [[ "$configuredHost" == "localhost" && "$dockerHintShown" != "true" ]]; then
+    echo "Hint: in containers/devcontainers, set ELASTICSEARCH_HOST and ELASTICSEARCH_PORT to the Docker host endpoint." >&2
+  fi
   exit 1
 }
 
