@@ -62,6 +62,11 @@ ELASTICSEARCH_PORT="${ELASTICSEARCH_PORT:-9200}"
 ELASTICSEARCH_USER="${ELASTICSEARCH_USER:-elastic}"
 ELASTICSEARCH_PASSWORD="${ELASTICSEARCH_PASSWORD:-elastic}"
 
+# Batch YAML section name for self-hosted Elasticsearch.
+# Prefer "elasticsearch". If this repo/version only supports Tencent ES style section,
+# you can override with: export ELASTICSEARCH_SECTION=tencentelasticsearch
+ELASTICSEARCH_SECTION="${ELASTICSEARCH_SECTION:-tencentelasticsearch}"
+
 PINECONE_API_KEY="${PINECONE_API_KEY:-}"
 PINECONE_INDEX_NAME="${PINECONE_INDEX_NAME:-vdbbench-sift}"
 
@@ -224,6 +229,7 @@ ensureElasticsearchReachable() {
   local host="" port="" scheme=""
   local attempted=""
   local dockerHintShown="false"
+  local hasElasticContainer="false"
 
   appendUnique() {
     local value="$1"
@@ -244,6 +250,18 @@ ensureElasticsearchReachable() {
     curl -s -o /dev/null -m 3 -u "${ELASTICSEARCH_USER}:${ELASTICSEARCH_PASSWORD}" "$url" 2>/dev/null       || curl -s -o /dev/null -m 3 "$url" 2>/dev/null
   }
 
+  detectElasticsearchContainer() {
+    if ! command -v docker >/dev/null 2>&1; then
+      return 1
+    fi
+
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 3 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq 'elasticsearch'
+    else
+      docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq 'elasticsearch'
+    fi
+  }
+
   appendUnique "$configuredHost" hosts
   appendUnique "$configuredPort" ports
   appendUnique "$configuredScheme" schemes
@@ -260,9 +278,14 @@ ensureElasticsearchReachable() {
   fi
 
   # If an elasticsearch container exists, include its published host port for 9200/tcp.
-  if command -v docker >/dev/null 2>&1     && docker ps -a --format '{{.Names}}' | grep -Fxq 'elasticsearch'; then
+  if detectElasticsearchContainer; then
+    hasElasticContainer="true"
     local mappedPort=""
-    mappedPort="$(docker port elasticsearch 9200/tcp 2>/dev/null | awk -F: 'NR==1 {print $NF}')"
+    if command -v timeout >/dev/null 2>&1; then
+      mappedPort="$(timeout 3 docker port elasticsearch 9200/tcp 2>/dev/null | awk -F: 'NR==1 {print $NF}')" || true
+    else
+      mappedPort="$(docker port elasticsearch 9200/tcp 2>/dev/null | awk -F: 'NR==1 {print $NF}')" || true
+    fi
     appendUnique "$mappedPort" ports
   fi
 
@@ -277,6 +300,7 @@ ensureElasticsearchReachable() {
       for port in "${ports[@]}"; do
         local url="${scheme}://${host}:${port}/"
         attempted+=" ${url}"
+        echo "[INFO] Checking Elasticsearch endpoint ${url} (${retries} retries max)..."
 
         for _ in $(seq 1 "$retries"); do
           if tryUrl "$url"; then
@@ -304,7 +328,7 @@ ensureElasticsearchReachable() {
   echo "Hint: attempted endpoints:${attempted}" >&2
   echo "Hint: start baseline services first (e.g. ./start_baseline.sh elasticsearch)." >&2
   echo "Hint: if your node uses TLS, set ELASTICSEARCH_SCHEME=https." >&2
-  if command -v docker >/dev/null 2>&1     && docker ps -a --format '{{.Names}}' | grep -Fxq 'elasticsearch'; then
+  if [[ "$hasElasticContainer" == "true" ]]; then
     echo "Hint: an 'elasticsearch' container exists; check readiness with: docker logs --tail 100 elasticsearch" >&2
     echo "Hint: inspect mapped ports with: docker port elasticsearch 9200/tcp" >&2
     dockerHintShown="true"
@@ -666,8 +690,9 @@ YML
   if wantSection "elasticsearch"; then
     cat >> "$OUT_YML" <<YML
 
-tencentelasticsearch:
+${ELASTICSEARCH_SECTION}:
 YML
+
     if [[ "$WANT_100K" == "true" ]]; then
       cat >> "$OUT_YML" <<YML
   - db_label: elasticsearch_sift100k

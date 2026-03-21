@@ -27,7 +27,7 @@ class ESElementType(str, Enum):
 
 class TencentElasticsearchIndexConfig(BaseModel, DBCaseConfig):
     element_type: ESElementType = ESElementType.float
-    index: IndexType = IndexType.TES_VSEARCH
+    index: IndexType = IndexType.ES_HNSW
     number_of_shards: int = 1
     number_of_replicas: int = 0
     refresh_interval: str = "3s"
@@ -80,7 +80,7 @@ class TencentElasticsearchIndexConfig(BaseModel, DBCaseConfig):
             "similarity": self.parse_metric(),
             "index_options": {
                 "type": self.index.value,
-                "index": "hnsw",
+                #"index": "hnsw",
                 "m": self.M,
                 "ef_construction": self.efConstruction,
             },
